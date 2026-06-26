@@ -1,0 +1,134 @@
+`include "sr_cpu.svh"
+
+module sr_cpu
+(
+    input           clk,      // clock
+    input           rst,      // reset
+
+    output  [31:0]  imAddr,   // instruction memory address
+    input   [31:0]  imData,   // instruction memory data (синхронная!)
+
+    input   [ 4:0]  regAddr,  // debug access reg address
+    output  [31:0]  regData   // debug access reg data
+);
+    // --- Логика VALID/STALL ---
+    // Так как память выдает инструкцию через такт, нам нужно 
+    // игнорировать выполнение каждый второй такт.
+    logic instr_valid;
+
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) 
+            instr_valid <= 1'b0;
+        else 
+            instr_valid <= !instr_valid; // Чередуем: такт запроса / такт ответа
+    end
+
+    // Инвертированный valid используем как stall для PC и записи в регистры
+    wire stall = !instr_valid;
+
+    // control wires
+    wire        aluZero;
+    wire        pcSrc;
+    wire        regWrite;
+    wire        aluSrc;
+    wire        wdSrc;
+    wire [2:0]  aluControl;
+
+    // instruction decode wires
+    wire [ 6:0] cmdOp;
+    wire [ 4:0] rd;
+    wire [ 2:0] cmdF3;
+    wire [ 4:0] rs1;
+    wire [ 4:0] rs2;
+    wire [ 6:0] cmdF7;
+    wire [31:0] immI;
+    wire [31:0] immB;
+    wire [31:0] immU;
+
+    // --- Program Counter ---
+    wire [31:0] pc;
+    wire [31:0] pcBranch = pc + immB;
+    wire [31:0] pcPlus4  = pc + 32'd4;
+    wire [31:0] pcNext   = pcSrc ? pcBranch : pcPlus4;
+
+    // Обновляем PC только когда инструкция пришла (в конце валидного такта)
+    register_with_rst_and_en r_pc
+    (
+        .clk      ( clk        ),
+        .rst      ( rst        ),
+        .en       ( instr_valid), 
+        .d        ( pcNext     ),
+        .q        ( pc         )
+    );
+
+    // program memory access
+    assign imAddr = pc >> 2;
+    // В невалидный такт на шине imData может быть старая инструкция
+    wire [31:0] instr = imData; 
+
+    // instruction decode
+    sr_decode id
+    (
+        .instr      ( instr       ),
+        .cmdOp      ( cmdOp       ),
+        .rd         ( rd          ),
+        .cmdF3      ( cmdF3       ),
+        .rs1        ( rs1         ),
+        .rs2        ( rs2         ),
+        .cmdF7      ( cmdF7       ),
+        .immI       ( immI        ),
+        .immB       ( immB        ),
+        .immU       ( immU        )
+    );
+
+    // register file
+    wire [31:0] rd0, rd1, rd2, wd3;
+
+    sr_register_file i_rf
+    (
+        .clk        ( clk                   ),
+        .a0         ( regAddr               ),
+        .a1         ( rs1                   ),
+        .a2         ( rs2                   ),
+        .a3         ( rd                    ),
+        .rd0        ( rd0                   ),
+        .rd1        ( rd1                   ),
+        .rd2        ( rd2                   ),
+        .wd3        ( wd3                   ),
+        // Разрешаем запись только если инструкция валидна
+        .we3        ( regWrite && instr_valid ) 
+    );
+
+    // alu
+    wire [31:0] srcB = aluSrc ? immI : rd2;
+    wire [31:0] aluResult;
+
+    sr_alu alu
+    (
+        .srcA        ( rd1          ),
+        .srcB        ( srcB         ),
+        .oper        ( aluControl   ),
+        .zero        ( aluZero      ),
+        .result      ( aluResult    )
+    );
+
+    assign wd3 = wdSrc ? immU : aluResult;
+
+    // control
+    sr_control sm_control
+    (
+        .cmdOp      ( cmdOp        ),
+        .cmdF3      ( cmdF3        ),
+        .cmdF7      ( cmdF7        ),
+        .aluZero    ( aluZero      ),
+        .pcSrc      ( pcSrc        ),
+        .regWrite   ( regWrite     ),
+        .aluSrc     ( aluSrc       ),
+        .wdSrc      ( wdSrc        ),
+        .aluControl ( aluControl   )
+    );
+
+    // debug register access
+    assign regData = (regAddr != '0) ? rd0 : pc;
+
+endmodule
